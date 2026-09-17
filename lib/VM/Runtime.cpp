@@ -59,6 +59,7 @@
 #include "llvh/ADT/DenseMap.h"
 #endif
 
+#include <cstdlib>
 #include <cstring>
 #include <future>
 
@@ -2360,6 +2361,10 @@ StackTracesTreeNode *Runtime::getCurrentStackTracesTreeNode(
   }
   const CodeBlock *codeBlock;
   std::tie(codeBlock, ip) = getCurrentInterpreterLocation(ip);
+  if (stackTracesTreeLazy_) {
+    // Nothing has maintained the tree head since the last sample.
+    stackTracesTree_->syncWithRuntimeStackForSampling(*this);
+  }
   return stackTracesTree_->getStackTrace(*this, codeBlock, ip);
 }
 
@@ -2389,6 +2394,10 @@ void Runtime::enableSamplingHeapProfiler(
   if (!stackTracesTree_) {
     stackTracesTree_ = std::make_unique<StackTracesTree>();
   }
+  // [Sleeper] Same one-shot latch the sampler's churn mode reads. Declining while the
+  // location tracker is live keeps its exact per-call state intact.
+  stackTracesTreeLazy_ = std::getenv("HERMES_SAMPLING_CHURN_MODE") != nullptr &&
+      !getHeap().getAllocationLocationTracker().isEnabled();
   stackTracesTree_->syncWithRuntimeStack(*this);
   getHeap().enableSamplingHeapProfiler(samplingInterval, seed);
 }
@@ -2396,6 +2405,7 @@ void Runtime::enableSamplingHeapProfiler(
 void Runtime::disableSamplingHeapProfiler(llvh::raw_ostream &os) {
   getHeap().disableSamplingHeapProfiler(os);
   stackTracesTree_.reset();
+  stackTracesTreeLazy_ = false;
 }
 
 void Runtime::popCallStackImpl() {

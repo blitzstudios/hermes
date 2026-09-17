@@ -1672,14 +1672,14 @@ class Runtime : public RuntimeBase, public HandleRootOwner {
   /// * At the entry point of a CodeBlock if this is the first entry into the
   ///   interpter loop.
   inline void pushCallStack(const CodeBlock *codeBlock, const inst::Inst *ip) {
-    if (stackTracesTree_) {
+    if (stackTracesTree_ && !stackTracesTreeLazy_) {
       pushCallStackImpl(codeBlock, ip);
     }
   }
 
   /// Must pair up with every call to \c pushCallStack .
   inline void popCallStack() {
-    if (stackTracesTree_) {
+    if (stackTracesTree_ && !stackTracesTreeLazy_) {
       popCallStackImpl();
     }
   }
@@ -1715,6 +1715,11 @@ class Runtime : public RuntimeBase, public HandleRootOwner {
   void popCallStackImpl();
   void pushCallStackImpl(const CodeBlock *codeBlock, const inst::Inst *ip);
   std::unique_ptr<StackTracesTree> stackTracesTree_;
+
+  /// [Sleeper] Rebuild the stack per sample instead of the find-or-create the tree
+  /// does on every call. Only the sampling profiler sets this; AllocationLocationTracker
+  /// needs exact per-call state and keeps the stock path.
+  bool stackTracesTreeLazy_{false};
 #endif
 };
 

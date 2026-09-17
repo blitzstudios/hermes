@@ -56,6 +56,12 @@ struct StackTracesTree {
   /// Must be called at the start of tracking the current call stack.
   void syncWithRuntimeStack(Runtime &runtime);
 
+  /// [Sleeper] \c syncWithRuntimeStack for the sampling profiler, which unlike the
+  /// one-shot caller above runs inside the allocator at an arbitrary point. It never
+  /// dereferences a frame's code block, so a bottom frame entered from native code is
+  /// skipped rather than crashing, and keeps its scratch stack inline to avoid malloc.
+  void syncWithRuntimeStackForSampling(Runtime &runtime);
+
   /// Get the root of the tree.
   StackTracesTreeNode *getRootNode() const;
 

@@ -15,6 +15,8 @@
 #include "hermes/VM/StringPrimitive.h"
 #include "hermes/VM/StringView.h"
 
+#include "llvh/ADT/SmallVector.h"
+
 namespace hermes {
 namespace vm {
 
@@ -89,6 +91,36 @@ StackTracesTree::StackTracesTree()
       nativeFunctionID_(strings_->insert("(native)")),
       anonymousFunctionID_(strings_->insert("(anonymous)")),
       head_(root_.get()) {}
+
+void StackTracesTree::syncWithRuntimeStackForSampling(Runtime &runtime) {
+  head_ = root_.get();
+
+  const StackFramePtr framesEnd = *runtime.getStackFrames().end();
+  llvh::SmallVector<std::pair<CodeBlock *, const Inst *>, 128> stack;
+
+  for (StackFramePtr cf : runtime.getStackFrames()) {
+    CodeBlock *savedCodeBlock = cf.getSavedCodeBlock();
+    const Inst *savedIP = cf.getSavedIP();
+    StackFramePtr prev = cf.getPreviousFrame();
+    if (prev != framesEnd) {
+      if (CodeBlock *parentCB = prev.getCalleeCodeBlock()) {
+        savedCodeBlock = parentCB;
+      }
+    } else {
+      // Bottom frame. Unlike the one-shot sync this can be reached from native
+      // code, where there is no callee code block to take an offset from.
+      savedCodeBlock = cf.getCalleeCodeBlock();
+      savedIP = savedCodeBlock ? savedCodeBlock->getOffsetPtr(0) : nullptr;
+    }
+    stack.emplace_back(savedCodeBlock, savedIP);
+  }
+
+  for (auto it = stack.rbegin(); it != stack.rend(); ++it) {
+    if (it->first && it->second) {
+      pushCallStack(runtime, it->first, it->second);
+    }
+  }
+}
 
 void StackTracesTree::syncWithRuntimeStack(Runtime &runtime) {
   head_ = root_.get();
