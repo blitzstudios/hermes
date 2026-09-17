@@ -136,6 +136,25 @@ set(HERMESVM_INDIRECT_THREADING ${DEFAULT_INTERPRETER_THREADING} CACHE BOOL
 set(HERMESVM_HEAP_HV_MODE HEAP_HV_64 CACHE STRING
   "Heap HV mode: HEAP_HV_64, HEAP_HV_PREFER32, HEAP_HV_BOXED")
 
+# Sleeper EXPERIMENT, Android only: give Android the same heap encoding iOS already runs.
+#
+# ReactAndroid/hermes-engine/build.gradle.kts passes -DHERMESVM_HEAP_HV_MODE=HEAP_HV_PREFER32,
+# which on 64-bit + Hades turns on compressed pointers AND boxed doubles, so Android stores every
+# heap HermesValue in 4 bytes and heap-allocates a cell for every non-small-int double. That buys a
+# roughly half-size heap and pays for it in CPU on every heap value access. Android is CPU-bound and
+# has never exceeded ~250MB of heap, so it is paying for a saving it does not need.
+#
+# FORCE is required: the gradle -D populates the cache before this file runs, so a plain set() is a
+# no-op. Guarded on ANDROID because iOS is already HEAP_HV_64 and must not be perturbed - the two
+# platforms share this tree.
+#
+# NOT A SHIPPING CHANGE. Uncommitted, and shipping it would double the JS heap for the whole Android
+# fleet, including low-RAM devices that upstream's PREFER32 default exists to protect.
+if(ANDROID OR CMAKE_SYSTEM_NAME STREQUAL "Android")
+  set(HERMESVM_HEAP_HV_MODE HEAP_HV_64 CACHE STRING
+    "Heap HV mode: HEAP_HV_64, HEAP_HV_PREFER32, HEAP_HV_BOXED" FORCE)
+endif()
+
 if(APPLE)
     set(DEFAULT_CONTIGUOUS_HEAP OFF)
 else()
