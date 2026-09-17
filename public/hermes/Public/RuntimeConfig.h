@@ -120,6 +120,13 @@ class PinnedHermesValue;
                                                                        \
   /* The flags passed from a VM experiment */                          \
   F(constexpr, uint32_t, VMExperimentFlags, 0)                         \
+                                                                       \
+  /* [Sleeper] Short-string interning. MaxChars is clamped to */       \
+  /* Runtime::kJSONInternMaxChars, which sizes the stack buffers; */   \
+  /* TableSize is rounded up to a power of two, and 0 disables */      \
+  /* interning entirely. See Runtime::internJSONStringValue. */        \
+  F(constexpr, uint32_t, InternMaxChars, 64)                           \
+  F(constexpr, uint32_t, InternTableSize, 262144)                      \
   /* RUNTIME_FIELDS END */
 
 _HERMES_CTORCONFIG_STRUCT(RuntimeConfig, RUNTIME_FIELDS, {})

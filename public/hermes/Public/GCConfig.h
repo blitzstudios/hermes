@@ -203,6 +203,21 @@ enum class GCEventKind {
     std::function<void(GCEventKind, const char *)>,                      \
     Callback,                                                            \
     nullptr)                                                             \
+                                                                         \
+  /* [Sleeper] Cells search() may walk in one freelist bucket */         \
+  /* before abandoning it for a larger one. 0 means unbounded, */        \
+  /* which is stock Hermes. See HadesGC::OldGen::search. */              \
+  F(constexpr, uint32_t, MaxSearchCellsPerBucket, 64)                    \
+                                                                         \
+  /* [Sleeper] Nursery size as a fraction of the segment size. */        \
+  /* The YG is one segment, so 1.0 is its ceiling and only the */        \
+  /* compile-time segment size can raise that. The controller in */      \
+  /* updateYoungGenSizeFactor walks the factor between Min and */        \
+  /* Max chasing TargetMaxPause; set Min == Max to pin it. */            \
+  F(constexpr, double, YGInitialSizeFactor, 0.5)                         \
+  F(constexpr, double, YGMinSizeFactor, 0.25)                            \
+  F(constexpr, double, YGMaxSizeFactor, 1.0)                             \
+  F(constexpr, uint32_t, YGTargetMaxPauseMs, 50)                         \
   /* GC_FIELDS END */
 
 _HERMES_CTORCONFIG_STRUCT(GCConfig, GC_FIELDS, {
