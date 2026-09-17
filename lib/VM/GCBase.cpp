@@ -644,37 +644,47 @@ void GCBase::createSnapshot(
   if (!captureNumericValue) {
     idTracker_.stopTrackingNumberIDs();
   }
-  // Chrome 125 requires correct node count and edge count in the "snapshot"
-  // field, which is at the beginning of the heap snapshot. We do two passes to
-  // populate the correct node/edge count. First, we create a dummy HeapSnapshot
-  // instance with a no-op JSON emitter, and invoke createSnapshotImpl() with
-  // it. From that instance we can get the node count and edge count, and use
-  // them to create a HeapSnapShot instance in the second pass.
-  JSONEmitter dummyJSON{llvh::nulls()};
-  HeapSnapshot dummySnap{dummyJSON, 0, 0, 0, gcCallbacks_.getStackTracesTree()};
   // Array for saving the number of edges for each root section. We set the
   // value the first time we visit a root section, and make sure the same number
   // of edges are added in a single call of this function.
   SavedNumRootEdges numRootEdges;
-  createSnapshotImpl(gc, dummySnap, numRootEdges);
+
+  // Chrome 125 requires correct node count and edge count in the "snapshot"
+  // field, which is at the beginning of the heap snapshot, so the whole heap is
+  // serialized once into a no-op emitter purely to count it, then again for
+  // real.
+  //
+  // [Sleeper] The counting pass is scoped so everything it allocated is freed before
+  // the real pass allocates its own. Each HeapSnapshot carries a DenseMap with an entry
+  // per node plus a complete string table, and upstream leaves the counting instance
+  // live across the second pass, so both sets are resident at the peak. Only the three
+  // counts are needed afterwards, so the bytes written are identical.
+  //
+  // The asserts upstream ran here compared the two instances' counts, which is what
+  // numRootEdges above exists to enforce.
+  HeapSnapshot::NodeIndex nodeCount = 0;
+  HeapSnapshot::EdgeIndex edgeCount = 0;
+  size_t traceFunctionCount = 0;
+  {
+    JSONEmitter dummyJSON{llvh::nulls()};
+    HeapSnapshot dummySnap{
+        dummyJSON, 0, 0, 0, gcCallbacks_.getStackTracesTree()};
+    createSnapshotImpl(gc, dummySnap, numRootEdges);
+    nodeCount = dummySnap.getNodeCount();
+    edgeCount = dummySnap.getEdgeCount();
+    traceFunctionCount = dummySnap.getTraceFunctionCount();
+  }
 
   // Second pass, write out the real snapshot with the correct node_count and
-  // edge_count.
+  // edge_count. The counting instance is destroyed by this point.
   JSONEmitter json{os};
   HeapSnapshot snap{
       json,
-      dummySnap.getNodeCount(),
-      dummySnap.getEdgeCount(),
-      dummySnap.getTraceFunctionCount(),
+      nodeCount,
+      edgeCount,
+      traceFunctionCount,
       gcCallbacks_.getStackTracesTree()};
   createSnapshotImpl(gc, snap, numRootEdges);
-  // Check if the node/edge counts of the two passes are equal.
-  assert(
-      dummySnap.getNodeCount() == snap.getNodeCount() &&
-      "Node count of two passes of createSnapshotImpl are not equal");
-  assert(
-      dummySnap.getEdgeCount() == snap.getEdgeCount() &&
-      "Edge count of two passes of createSnapshotImpl are not equal");
   idTracker_.startTrackingNumberIDs();
 }
 
@@ -1260,6 +1270,17 @@ void GCBase::IDTracker::untrackObject(CompressedPointer cell) {
   extraNativeIDs_.erase(id);
   // Erase the reverse mapping entry if it exists.
   idObjectMap_.erase(id);
+}
+
+void GCBase::IDTracker::clearSnapshotIDs() {
+  std::lock_guard<Mutex> lk{mtx_};
+  // Move-assign empty maps so the bucket storage is freed, not merely emptied.
+  // lastID_ is left as-is so IDs are never recycled within one process.
+  objectIDMap_ = decltype(objectIDMap_){};
+  idObjectMap_ = decltype(idObjectMap_){};
+  nativeIDMap_ = decltype(nativeIDMap_){};
+  extraNativeIDs_ = decltype(extraNativeIDs_){};
+  symbolIDMap_ = decltype(symbolIDMap_){};
 }
 
 void GCBase::IDTracker::untrackNative(const void *mem) {

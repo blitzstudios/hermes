@@ -363,7 +363,15 @@ class HadesGC::CollectionStats final {
             /*size*/ BeforeAndAfter{sizeBefore_, sizeAfter_},
             /*external*/ BeforeAndAfter{externalBefore_, afterExternalBytes()},
             /*survivalRatio*/ survivalRatio(),
-            /*tags*/ std::move(tags_)},
+            /*tags*/ std::move(tags_),
+            // [Sleeper] Per-young-GC counters into the analytics ring. Zeroed on
+            // old/full collections so stale last-YG values don't leak.
+            /*ygFreelistCellsWalked*/ collectionType_ == "young" ? gc_.ygFreelistCellsWalked_ : 0,
+            /*ygOgAllocUs*/ collectionType_ == "young" ? gc_.scaleYGEvacSample(gc_.ygOgAllocNs_) / 1000 : 0,
+            /*ygCopyUs*/ collectionType_ == "young" ? gc_.scaleYGEvacSample(gc_.ygCopyNs_) / 1000 : 0,
+            /*ygMarkRootsUs*/ collectionType_ == "young" ? gc_.ygMarkRootsUs_ : 0,
+            /*ygScanCardsUs*/ collectionType_ == "young" ? gc_.ygScanCardsUs_ : 0,
+            /*ygEvacDrainUs*/ collectionType_ == "young" ? gc_.ygEvacDrainUs_ : 0},
         /*durationSecs*/ std::chrono::duration<double>(wallTime).count(),
         /*cpuDurationSecs*/
         std::chrono::duration<double>(cpuDuration_).count()};
@@ -503,7 +511,24 @@ class HadesGC::EvacAcceptor final : public RootAcceptor,
     assert(cell->isValid() && "Encountered an invalid cell");
     const auto cellSize = cell->getAllocatedSize();
     // Newly discovered cell, first forward into the old gen.
+    //
+    // [Sleeper] Splits promotion cost into finding a free cell versus the memcpy,
+    // timed on one promotion in kYGEvacSampleInterval and scaled up at report time.
+    // Timing every promotion cost three clock reads on each of ~65M cells a session,
+    // about 17% of all young-GC time, to measure a ratio that a few hundred samples
+    // per collection already settle. The countdown starts at 0 each collection, so
+    // one that promotes at all contributes at least one sample.
+    const bool sleeperSample = gc.ygEvacCountdown_ == 0;
+    gc.ygEvacCountdown_ =
+        sleeperSample ? kYGEvacSampleInterval - 1 : gc.ygEvacCountdown_ - 1;
+    gc.ygEvacCells_++;
+    const auto sleeperEvT0 = sleeperSample
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     GCCell *const newCell = gc.oldGen_.alloc(cellSize);
+    const auto sleeperEvT1 = sleeperSample
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     HERMES_SLOW_ASSERT(
         gc.inOldGen(newCell) && "Evacuated cell not in the old gen");
     assert(
@@ -511,6 +536,15 @@ class HadesGC::EvacAcceptor final : public RootAcceptor,
         "Cell must be marked when it is allocated into the old gen");
     // Copy the contents of the existing cell over before modifying it.
     std::memcpy((void *)newCell, cell, cellSize);
+    if (sleeperSample) {
+      const auto sleeperEvT2 = std::chrono::steady_clock::now();
+      gc.ygOgAllocNs_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             sleeperEvT1 - sleeperEvT0)
+                             .count();
+      gc.ygCopyNs_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          sleeperEvT2 - sleeperEvT1)
+                          .count();
+    }
     assert(newCell->isValid() && "Cell was copied incorrectly");
     evacuatedBytes_ += cellSize;
     CopyListCell *const copyCell = static_cast<CopyListCell *>(cell);
@@ -1264,6 +1298,22 @@ void HadesGC::getHeapInfo(HeapInfo &info) {
   info.totalAllocatedBytes = totalAllocatedBytes_ + youngGen().used();
   info.va = info.heapSize;
   info.externalBytes = oldGen_.externalBytes() + getYoungGenExternalBytes();
+  // [Sleeper] The state that decides when an OG collection runs, and so drives the
+  // "degenerate" young-GC mode of an OG that stays engaged. gcMutex_ is held above.
+  info.ogCollectionActive = concurrentPhase_ != Phase::None ? 1 : 0;
+  info.ogThreshold = static_cast<double>(ogThreshold_);
+  info.ogTargetSizeBytes = oldGen_.targetSizeBytes();
+  info.occupancyTarget = occupancyTarget_;
+  // [Sleeper] See the field declarations in HadesGC.h for what these measure.
+  info.ygDirtyCardsScanned = ygDirtyCardsScanned_;
+  info.ygCellsScannedFromCards = ygCellsScannedFromCards_;
+  info.ygMarkRootsUs = ygMarkRootsUs_;
+  info.ygScanCardsUs = ygScanCardsUs_;
+  info.ygEvacDrainUs = ygEvacDrainUs_;
+  info.numCompactions = numCompactions_;
+  info.ygOgAllocUs = scaleYGEvacSample(ygOgAllocNs_) / 1000;
+  info.ygCopyUs = scaleYGEvacSample(ygCopyNs_) / 1000;
+  info.ygFreelistCellsWalked = ygFreelistCellsWalked_;
 }
 
 void HadesGC::getHeapInfoWithMallocSize(HeapInfo &info) {
@@ -2454,6 +2504,8 @@ GCCell *HadesGC::OldGen::search(uint32_t sz) {
       do {
         auto *cell =
             vmcast<FreelistCell>(cellCP.getNonNull(gc_.getPointerBase()));
+        // [Sleeper] Every free-list cell examined by this first-fit walk.
+        ++gc_.ygFreelistCellsWalked_;
         assert(
             cellCP == *prevLoc &&
             "prevLoc should be updated in each iteration");
@@ -2519,6 +2571,14 @@ template <bool CompactionEnabled>
 uint64_t HadesGC::youngGenEvacuateImpl(bool doCompaction) {
   assert((!doCompaction || CompactionEnabled) && "Compaction is disabled");
   EvacAcceptor<CompactionEnabled> acceptor{*this, doCompaction};
+  // [Sleeper] Reset the per-YG counters that forwardCell and OldGen::search fill,
+  // so they end up holding this young-GC's totals.
+  ygOgAllocNs_ = 0;
+  ygCopyNs_ = 0;
+  ygEvacCells_ = 0;
+  ygEvacCountdown_ = 0;
+  ygFreelistCellsWalked_ = 0;
+  const auto sleeperYgT0 = std::chrono::steady_clock::now();
   // Marking each object puts it onto an embedded free list.
   {
     DroppingAcceptor nameAcceptor{acceptor};
@@ -2534,9 +2594,11 @@ uint64_t HadesGC::youngGenEvacuateImpl(bool doCompaction) {
     acceptor.accept(slot.mappedValue);
   });
 
+  const auto sleeperYgT1 = std::chrono::steady_clock::now();
   // Find old-to-young pointers, as they are considered roots for YG
   // collection.
   scanDirtyCards(acceptor, doCompaction);
+  const auto sleeperYgT2 = std::chrono::steady_clock::now();
   // Iterate through the copy list to find new pointers.
   auto &pb = getPointerBase();
   while (acceptor.copyListHead) {
@@ -2559,6 +2621,18 @@ uint64_t HadesGC::youngGenEvacuateImpl(bool doCompaction) {
     acceptor.setCurrentCell(cell);
     markCell(acceptor, cell);
   }
+
+  // [Sleeper] Phases done; record per-phase µs. dur==cpu for a YG (STW, single thread).
+  const auto sleeperYgT3 = std::chrono::steady_clock::now();
+  ygMarkRootsUs_ = std::chrono::duration_cast<std::chrono::microseconds>(
+                       sleeperYgT1 - sleeperYgT0)
+                       .count();
+  ygScanCardsUs_ = std::chrono::duration_cast<std::chrono::microseconds>(
+                       sleeperYgT2 - sleeperYgT1)
+                       .count();
+  ygEvacDrainUs_ = std::chrono::duration_cast<std::chrono::microseconds>(
+                       sleeperYgT3 - sleeperYgT2)
+                       .count();
 
   // Mark weak roots. We only need to update the long lived weak roots if we are
   // evacuating part of the OG.
@@ -2883,6 +2957,7 @@ void HadesGC::scanDirtyCardsForSegment(
         "non-dirty card after a sequence of dirty cards");
     assert(iBegin < iEnd && "Indices must be apart by at least one");
 
+    ygDirtyCardsScanned_ += (iEnd - iBegin); // [Sleeper]
     const char *const begin = seg.cardIndexToAddress(iBegin);
     const char *const end = seg.cardIndexToAddress(iEnd);
     // Don't try to mark any cell past the original boundary of the segment.
@@ -2905,6 +2980,7 @@ void HadesGC::scanDirtyCardsForSegment(
 
     // Mark the first object with respect to the dirty card boundaries.
     if (visitUnmarked || AlignedHeapSegment::getCellMarkBit(obj)) {
+      ++ygCellsScannedFromCards_; // [Sleeper]
       acceptor.setCurrentCell(obj);
       markCellWithinRange(acceptor, obj, begin, end);
     }
@@ -2919,6 +2995,7 @@ void HadesGC::scanDirtyCardsForSegment(
       for (GCCell *next = obj->nextCell(); next < boundary;
            next = next->nextCell()) {
         if (visitUnmarked || AlignedHeapSegment::getCellMarkBit(obj)) {
+          ++ygCellsScannedFromCards_; // [Sleeper]
           acceptor.setCurrentCell(obj);
           markCell(acceptor, obj);
         }
@@ -2931,6 +3008,7 @@ void HadesGC::scanDirtyCardsForSegment(
           obj < boundary && obj->nextCell() >= boundary &&
           "Last object in card must touch or cross cross the card boundary");
       if (visitUnmarked || AlignedHeapSegment::getCellMarkBit(obj)) {
+        ++ygCellsScannedFromCards_; // [Sleeper]
         acceptor.setCurrentCell(obj);
         markCellWithinRange(acceptor, obj, begin, end);
       }
@@ -2974,6 +3052,9 @@ void HadesGC::scanDirtyCardsForSegment(
     const char *const begin = seg.cardIndexToAddress(iBegin);
     const char *const end = seg.cardIndexToAddress(iEnd);
 
+    // [Sleeper] Jumbo OG segments count too.
+    ygDirtyCardsScanned_ += (iEnd - iBegin);
+    ++ygCellsScannedFromCards_;
     markCellWithinRange(acceptor, cell, begin, end);
 
     from = iEnd;
@@ -2985,6 +3066,11 @@ void HadesGC::scanDirtyCards(
     EvacAcceptor<CompactionEnabled> &acceptor,
     bool doCompaction) {
   const bool preparingCompaction = CompactionEnabled && !doCompaction;
+  // [Sleeper] Reset per-YG card-scan counters; accumulated in
+  // scanDirtyCardsForSegment below. They persist as the "last YG" totals read by
+  // getHeapInfo() until the next young-GC resets them here.
+  ygDirtyCardsScanned_ = 0;
+  ygCellsScannedFromCards_ = 0;
   // The acceptors in this loop can grow the old gen by adding another
   // segment, if there's not enough room to evac the YG objects discovered.
   // Since segments are always placed at the end, we can use indices instead

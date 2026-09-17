@@ -158,6 +158,33 @@ CallResult<HermesValue> hermesInternalGetInstrumentedStats(
   ADD_PROP("js_vaSize", info.va);
   ADD_PROP("js_externalBytes", info.externalBytes);
   ADD_PROP("js_markStackOverflows", info.numMarkStackOverflows);
+  // [Sleeper] Internal HadesGC state (0 on non-Hades GCs). Surfaced so the perf
+  // overlay / diagnostics can see when an OG collection is engaged and what the
+  // OG trigger threshold / target size are.
+  ADD_PROP("js_ogCollectionActive", info.ogCollectionActive);
+  ADD_PROP("js_ogThreshold", info.ogThreshold);
+  ADD_PROP("js_ogTargetSizeBytes", info.ogTargetSizeBytes);
+  ADD_PROP("js_occupancyTarget", info.occupancyTarget);
+  // [Sleeper] Per-young-GC card-scan volume — the old->young remembered-set
+  // work that is the suspected driver of the post-compaction young-GC cost
+  // regime. Watch these flip at a snapshot/Force-GC alongside ms/coll.
+  ADD_PROP("js_ygDirtyCardsScanned", info.ygDirtyCardsScanned);
+  ADD_PROP("js_ygCellsScannedFromCards", info.ygCellsScannedFromCards);
+  // [Sleeper] Per-phase young-GC timing (µs, last YG): markRoots / scanDirtyCards
+  // / copy-list drain. Decisive for attributing the post-compaction cost flip.
+  ADD_PROP("js_ygMarkRootsUs", info.ygMarkRootsUs);
+  ADD_PROP("js_ygScanCardsUs", info.ygScanCardsUs);
+  ADD_PROP("js_ygEvacDrainUs", info.ygEvacDrainUs);
+  // [Sleeper] Cumulative OG compactions (confirms the compaction-disable
+  // experiment: stays 0 when disabled).
+  ADD_PROP("js_numCompactions", info.numCompactions);
+  // [Sleeper] Evac-copy breakdown (µs, last YG): OG alloc (freelist) vs memcpy.
+  ADD_PROP("js_ygOgAllocUs", info.ygOgAllocUs);
+  ADD_PROP("js_ygCopyUs", info.ygCopyUs);
+  // [Sleeper] OG free-list cells walked by OldGen::search this YG. Divided by
+  // survivors = avg first-fit walk length; climbs with fragmentation across
+  // bg/fg cycles even at a flat heap size.
+  ADD_PROP("js_ygFreelistCellsWalked", info.ygFreelistCellsWalked);
 #undef ADD_PROP
 
   return lv.resultHandle.getHermesValue();
@@ -187,6 +214,19 @@ static const char *getCJSModuleModeDescription(Runtime &runtime) {
     return "Statically resolved";
   }
   return "None";
+}
+
+/// [Sleeper] Drop object IDs left over from a one-shot heap snapshot so
+/// isTrackingIDs() goes false again and subsequent young-GCs stop paying the
+/// per-dead-cell untrackObject() hashmap tax (the permanent post-snapshot
+/// ms/coll regression). Call from JS right after capturing a snapshot, unless
+/// keeping IDs stable for a DevTools cross-snapshot comparison. \return true if
+/// IDs were cleared, false if an allocation tracker is active.
+CallResult<HermesValue> hermesInternalClearHeapSnapshotIDs(
+    void *,
+    Runtime &runtime) {
+  return HermesValue::encodeBoolValue(
+      runtime.getHeap().clearHeapSnapshotObjectIDs());
 }
 
 /// \return an object mapping keys to runtime property values.
@@ -821,6 +861,13 @@ HermesValue createHermesInternalObject(
     defineInternMethod(
         P::getInstrumentedStats, hermesInternalGetInstrumentedStats);
   }
+
+  // [Sleeper] Lets the debug overlay reset heap-snapshot object-ID tracking so
+  // capturing a snapshot doesn't permanently inflate young-GC ms/coll. Defined
+  // with a string symbol (no Predefined entry needed), alongside the
+  // always-available getInstrumentedStats.
+  defineInternMethodAndSymbol(
+      "clearHeapSnapshotIDs", hermesInternalClearHeapSnapshotIDs, 0);
 
   // HermesInternal function that are only meant to be used for testing purpose.
   // They can change language semantics and are security risks.

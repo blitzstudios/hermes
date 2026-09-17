@@ -477,6 +477,31 @@ class GCBase {
     /// Cumulative number of mark stack overflows in full collections
     /// (zero if non-generational GC).
     unsigned numMarkStackOverflows{0};
+    /// [Sleeper] Hades-only instrumentation, zero on every other GC. The yg* fields
+    /// describe the most recent young-GC and persist until the next one.
+    /// 1 while an OG collection is in flight.
+    uint64_t ogCollectionActive{0};
+    /// Occupied fraction (allocatedBytes/targetSizeBytes) at which an OG starts.
+    double ogThreshold{0};
+    /// OG target size in bytes, an EMA of live/occupancyTarget.
+    uint64_t ogTargetSizeBytes{0};
+    double occupancyTarget{0};
+    /// Old->young remembered-set work: dirty OG cards scanned, and cells marked
+    /// from them.
+    uint64_t ygDirtyCardsScanned{0};
+    uint64_t ygCellsScannedFromCards{0};
+    /// Per-phase timing (µs): markRoots, scanDirtyCards, copy-list drain.
+    uint64_t ygMarkRootsUs{0};
+    uint64_t ygScanCardsUs{0};
+    uint64_t ygEvacDrainUs{0};
+    /// Cumulative OG compactions.
+    uint64_t numCompactions{0};
+    /// Evacuation-copy breakdown (µs): OG freelist allocation vs memcpy.
+    uint64_t ygOgAllocUs{0};
+    uint64_t ygCopyUs{0};
+    /// OG free-list cells walked by OldGen::search. Over survivors promoted, the
+    /// average first-fit walk length.
+    uint64_t ygFreelistCellsWalked{0};
     /// Stats for full collections (zeroes if non-generational GC).
     CumulativeHeapStats fullStats;
     /// Stats for collections in the young generation (zeroes if
@@ -800,6 +825,11 @@ class GCBase {
     /// Remove the object from being tracked. This should be done to keep the
     /// tracking working set small.
     void untrackObject(CompressedPointer cell);
+
+    /// [Sleeper] Drop every object/native/symbol ID a one-shot heap snapshot
+    /// accumulated, freeing the maps, so later young-GCs stop paying the
+    /// per-dead-cell untrackObject() tax. Requires that no tracker is active.
+    void clearSnapshotIDs();
 
     /// Remove the symbol from being tracked. This needs to be done to allow
     /// symbols to be re-used.
@@ -1217,6 +1247,20 @@ class GCBase {
 #else
     return getIDTracker().hasTrackedObjectIDs();
 #endif
+  }
+
+  /// [Sleeper] Clear object IDs left by a one-shot heap snapshot so
+  /// isTrackingIDs() goes false again; otherwise every later young-GC walks all
+  /// dead young cells calling IDTracker::untrackObject(). No-op returning false
+  /// while a tracker is active, since it needs IDs to stay stable.
+  bool clearHeapSnapshotObjectIDs() {
+#ifdef HERMES_MEMORY_INSTRUMENTATION
+    if (getAllocationLocationTracker().isEnabled() ||
+        getSamplingAllocationTracker().isEnabled())
+      return false;
+#endif
+    idTracker_.clearSnapshotIDs();
+    return true;
   }
 
   IDTracker &getIDTracker() {

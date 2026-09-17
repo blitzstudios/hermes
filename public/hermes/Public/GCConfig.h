@@ -38,6 +38,12 @@ struct BeforeAndAfter {
   uint64_t after;
 };
 
+// [Sleeper] Defined by this from-source GC-internals patch so the RN glue
+// (HermesInstance.cpp) — which compiles against EITHER prebuilt or from-source
+// Hermes — can conditionally read the per-young-GC fields added to
+// GCAnalyticsEvent below. Undefined on prebuilt Hermes, where they don't exist.
+#define HERMES_SLEEPER_GC_INTERNALS 1
+
 struct GCAnalyticsEvent {
   /// The same value as \p Name from GCConfig. Stored here for simplicity of
   /// the API since this is passed in callbacks that might not be able to store
@@ -93,6 +99,17 @@ struct GCAnalyticsEvent {
 
   /// A list of metadata tags to annotate this event with.
   std::vector<std::string> tags;
+
+  // [Sleeper] Per-young-GC HadesGC instrumentation (0 for old/full events and on
+  // non-Hades GCs), populated in HadesGC::CollectionStats::getEvent(). Lets the
+  // on-device analytics ring record a TRUE per-collection fragmentation/cost
+  // series instead of a 1Hz getInstrumentedStats() snapshot of only the last YG.
+  uint64_t ygFreelistCellsWalked{0};
+  uint64_t ygOgAllocUs{0};
+  uint64_t ygCopyUs{0};
+  uint64_t ygMarkRootsUs{0};
+  uint64_t ygScanCardsUs{0};
+  uint64_t ygEvacDrainUs{0};
 };
 
 /// Parameters to control a tripwire function called when the live set size

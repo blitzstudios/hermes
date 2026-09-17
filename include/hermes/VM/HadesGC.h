@@ -1222,6 +1222,52 @@ class HadesGC final : public GCBase {
   /// at which we should start an OG collection.
   ExponentialMovingAverage ogThreshold_{0.5, 0.75};
 
+  /// [Sleeper] Per-young-GC instrumentation, below. Each field is reset at the start
+  /// of the young-GC that fills it and holds that YG's totals until the next one.
+  /// All are written only during the STW young-GC and read under gcMutex_ by
+  /// getHeapInfo(), so they need no locking of their own.
+  ///
+  /// Old->young remembered-set work: dirty OG cards visited, and OG cells marked
+  /// from those cards.
+  uint64_t ygDirtyCardsScanned_{0};
+  uint64_t ygCellsScannedFromCards_{0};
+
+  /// Splits the STW young pause (µs) into markRoots, scanDirtyCards and
+  /// copy-list drain.
+  uint64_t ygMarkRootsUs_{0};
+  uint64_t ygScanCardsUs_{0};
+  uint64_t ygEvacDrainUs_{0};
+
+  /// Evacuation-copy breakdown (ns): time in oldGen_.alloc versus time in the
+  /// memcpy to the destination, summed over the sampled copies only. Read through
+  /// scaleYGEvacSample, never directly.
+  uint64_t ygOgAllocNs_{0};
+  uint64_t ygCopyNs_{0};
+
+  /// Cells forwarded this young GC, of which every kYGEvacSampleInterval'th is
+  /// timed, and the countdown to the next sample.
+  ///
+  /// The interval must stay PRIME. A power-of-two stride aliases against the
+  /// power-of-two periodicity an allocator naturally has (size classes, bucket
+  /// counts, alignment): measured against a cost signal cycling with period
+  /// 2/4/8/../256, a stride of 64 underestimates by 9% to 86%, while 67 is exact
+  /// to within 0.2%.
+  static constexpr uint64_t kYGEvacSampleInterval = 67;
+  uint64_t ygEvacCells_{0};
+  uint64_t ygEvacCountdown_{0};
+
+  /// Scales a sampled evacuation total up to the whole population. Zero when
+  /// nothing was promoted, so a caller cannot mistake absence for zero cost.
+  uint64_t scaleYGEvacSample(uint64_t sampledNs) const {
+    const uint64_t sampled =
+        (ygEvacCells_ + kYGEvacSampleInterval - 1) / kYGEvacSampleInterval;
+    return sampled ? sampledNs * ygEvacCells_ / sampled : 0;
+  }
+
+  /// OG free-list cells walked by OldGen::search. Over the survivor count, the
+  /// average first-fit walk length.
+  uint64_t ygFreelistCellsWalked_{0};
+
   /// A collection section used to track the size of YG before and after a YG
   /// collection, as well as the time a YG collection takes.
   std::unique_ptr<CollectionStats> ygCollectionStats_;
