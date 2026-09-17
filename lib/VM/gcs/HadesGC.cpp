@@ -50,8 +50,10 @@ static const char *kGCName =
 static const char *kCompacteeNameForCrashMgr = "COMPACT";
 static const char *kYGNameForCrashMgr = "YG";
 
-// We have a target max pause time of 50ms.
-static constexpr size_t kTargetMaxPauseMs = 50;
+// [Sleeper] The target max pause time moved to GCConfig's YGTargetMaxPauseMs
+// (still defaulting to 50ms) and is read through ygTargetMaxPauseMs_, so that
+// it can be retuned without a native build. The file-scope constant is gone
+// rather than left unused, which would warn.
 
 // Assert that it is always safe to construct a cell that is as large as the
 // entire segment. This lets us always assume that contiguous regions in a
@@ -1251,6 +1253,19 @@ HadesGC::HadesGC(
           // At least one YG segment and one OG segment.
           2 * FixedSizeHeapSegment::storageSize())},
       provider_(std::move(provider)),
+      // [Sleeper] Clamped rather than trusted: these arrive from a CodePushable
+      // JSON file, and a factor of 0 would give the nursery no room to allocate
+      // in while a min above max would break the controller's own invariant.
+      // Ordered here, before oldGen_, to match declaration order.
+      ygMinSizeFactor_(
+          std::clamp(gcConfig.getYGMinSizeFactor(), kYGMinAllowedSizeFactor, 1.0)),
+      ygMaxSizeFactor_(
+          std::clamp(gcConfig.getYGMaxSizeFactor(), ygMinSizeFactor_, 1.0)),
+      ygTargetMaxPauseMs_(std::max(gcConfig.getYGTargetMaxPauseMs(), 1u)),
+      ygSizeFactor_(std::clamp(
+          gcConfig.getYGInitialSizeFactor(),
+          ygMinSizeFactor_,
+          ygMaxSizeFactor_)),
       oldGen_{*this},
       backgroundExecutor_{
           kConcurrentGC ? std::make_unique<Executor>() : nullptr},
@@ -1258,9 +1273,10 @@ HadesGC::HadesGC(
       revertToYGAtTTI_{gcConfig.getRevertToYGAtTTI()},
       overwriteDeadYGObjects_{gcConfig.getOverwriteDeadYGObjects()},
       occupancyTarget_(gcConfig.getOccupancyTarget()),
+      maxSearchCellsPerBucket_(gcConfig.getMaxSearchCellsPerBucket()),
       ygAverageSurvivalBytes_{
           /*weight*/ 0.5,
-          /*init*/ kYGInitialSizeFactor * FixedSizeHeapSegment::maxSize() *
+          /*init*/ ygSizeFactor_ * FixedSizeHeapSegment::maxSize() *
               kYGInitialSurvivalRatio} {
   (void)vmExperimentFlags;
   std::lock_guard<Mutex> lk(gcMutex_);
@@ -2398,7 +2414,10 @@ GCCell *HadesGC::OldGen::allocSlow(uint32_t sz) {
   assert(
       sz <= maxNormalAllocationSize() && "Allocating too large of an object");
   assert(gc_.gcMutex_ && "gcMutex_ must be held before calling oldGenAlloc");
-  if (GCCell *cell = search(sz)) {
+  // [Sleeper] Budgeted: a null here falls through to createSegment(), so giving
+  // up early costs at most a segment, and this is the call on the promotion hot
+  // path that the budget exists for.
+  if (GCCell *cell = search(sz, Budgeted::Yes)) {
     return cell;
   }
 
@@ -2433,7 +2452,13 @@ GCCell *HadesGC::OldGen::allocSlow(uint32_t sz) {
   gc_.waitForCollectionToFinish("full heap");
 
   // Repeat the search in case the collection did free memory.
-  if (GCCell *cell = search(sz)) {
+  // [Sleeper] Unbudgeted, and this is the important one: we are already at the
+  // max heap size, createSegment() has failed once, and the only thing after
+  // this is oom(). A budgeted search can return null while a usable cell sits
+  // at position 65 of a bucket, which would turn a survivable allocation into
+  // a crash. Completeness matters more than latency on a path that has already
+  // blocked the mutator on waitForCollectionToFinish.
+  if (GCCell *cell = search(sz, Budgeted::No)) {
     return cell;
   }
   // It's possible that the collection freed some JumboHeapSegments, so try
@@ -2471,10 +2496,19 @@ uint32_t HadesGC::OldGen::getFreelistBucket(uint32_t size) {
   return bucket;
 }
 
-GCCell *HadesGC::OldGen::search(uint32_t sz) {
+GCCell *HadesGC::OldGen::search(uint32_t sz, Budgeted budgeted) {
   // Once we're examining the rest of the free list, it's a first-fit algorithm.
   // This approach approximates finding the smallest possible fit.
   //
+  // [Sleeper] The budget is GCConfig's MaxSearchCellsPerBucket, where 0 means
+  // unbounded, so a bad config degrades to stock Hermes rather than to a
+  // nursery that cannot promote. ~0u rather than numeric_limits, which would
+  // need an extra include here.
+  const uint32_t configuredBudget = gc_.maxSearchCellsPerBucket_;
+  const uint32_t cellBudget =
+      (budgeted == Budgeted::Yes && configuredBudget != 0) ? configuredBudget
+                                                           : ~0u;
+
   // A free cell serves sz either as an exact fit or by splitting off a
   // remainder of at least minAllocationSize(); a cell sized strictly between
   // the two is dead, being neither takeable nor splittable. So when the exact
@@ -2495,6 +2529,13 @@ GCCell *HadesGC::OldGen::search(uint32_t sz) {
         getFreelistBucket(sz + minAllocationSize()));
   for (; bucket < kNumFreelistBuckets;
        bucket = freelistBucketBitArray_.findNextSetBitFrom(bucket + 1)) {
+    // [Sleeper] Budget is per bucket, not per call, so abandoning a hopeless
+    // bucket still leaves every larger one reachable. See GCConfig's
+    // MaxSearchCellsPerBucket. If they are all abandoned, search
+    // returns nullptr and allocSlow falls back to a fresh segment, which is
+    // the same path a genuinely full freelist already takes.
+    uint32_t cellsWalkedInBucket = 0;
+    bool budgetExhausted = false;
     auto *segBucket = buckets_[bucket].next;
     do {
       // Need to track the previous entry in order to change the next pointer.
@@ -2502,6 +2543,13 @@ GCCell *HadesGC::OldGen::search(uint32_t sz) {
       AssignableCompressedPointer cellCP = segBucket->head;
 
       do {
+        // [Sleeper] Checked before the cell is touched so the walk stops at the
+        // budget rather than one cell past it.
+        if (cellsWalkedInBucket >= cellBudget) {
+          budgetExhausted = true;
+          break;
+        }
+        ++cellsWalkedInBucket;
         auto *cell =
             vmcast<FreelistCell>(cellCP.getNonNull(gc_.getPointerBase()));
         // [Sleeper] Every free-list cell examined by this first-fit walk.
@@ -2561,6 +2609,10 @@ GCCell *HadesGC::OldGen::search(uint32_t sz) {
         prevLoc = &cell->next_;
         cellCP = cell->next_;
       } while (cellCP);
+      // [Sleeper] The budget spans every segment's list for this bucket, so it
+      // has to end the segment walk too, not just the cell walk.
+      if (budgetExhausted)
+        break;
       segBucket = segBucket->next;
     } while (segBucket);
   }
@@ -2908,18 +2960,22 @@ void HadesGC::transferExternalMemoryToOldGen() {
 }
 
 void HadesGC::updateYoungGenSizeFactor() {
+  // [Sleeper] Bounds and pause target come from GCConfig instead of being
+  // fixed at 0.25/1.0/50ms, so the nursery can be retuned without a native
+  // build. With min == max this is a no-op and the nursery stays pinned.
   assert(
-      ygSizeFactor_ <= 1.0 && ygSizeFactor_ >= 0.25 && "YG size out of range.");
+      ygSizeFactor_ <= ygMaxSizeFactor_ && ygSizeFactor_ >= ygMinSizeFactor_ &&
+      "YG size out of range.");
   const auto ygDuration = ygCollectionStats_->getElapsedTime().count();
   // If the YG collection has taken less than 20% of our budgeted time, increase
   // the size of the YG by 10%.
-  if (ygDuration < kTargetMaxPauseMs * 0.2)
-    ygSizeFactor_ = std::min(ygSizeFactor_ * 1.1, 1.0);
+  if (ygDuration < ygTargetMaxPauseMs_ * 0.2)
+    ygSizeFactor_ = std::min(ygSizeFactor_ * 1.1, ygMaxSizeFactor_);
   // If the YG collection has taken more than 40% of our budgeted time, decrease
   // the size of the YG by 10%. This is meant to leave some time for OG work.
-  // However, don't let the YG size drop below 25% of the segment size.
-  else if (ygDuration > kTargetMaxPauseMs * 0.4)
-    ygSizeFactor_ = std::max(ygSizeFactor_ * 0.9, 0.25);
+  // However, don't let the YG size drop below the configured minimum.
+  else if (ygDuration > ygTargetMaxPauseMs_ * 0.4)
+    ygSizeFactor_ = std::max(ygSizeFactor_ * 0.9, ygMinSizeFactor_);
 }
 
 template <bool CompactionEnabled>
@@ -3356,7 +3412,10 @@ void HadesGC::yieldToOldGen() {
     if (concurrentPhase_ == Phase::Mark)
       updateDrainRate();
 
-    constexpr uint32_t kYGIncrementalCollectBudget = kTargetMaxPauseMs / 2;
+    // [Sleeper] Follows the configured pause target rather than the fixed
+    // 50ms, so that retuning the target moves the incremental OG budget with
+    // it and the "half now, half worst case" reasoning below still holds.
+    const uint32_t kYGIncrementalCollectBudget = ygTargetMaxPauseMs_ / 2;
     const auto initialPhase = concurrentPhase_;
     // If the phase hasn't changed and we are still under 25ms after the first
     // iteration, then we can be reasonably sure that the next iteration will
