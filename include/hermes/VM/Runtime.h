@@ -475,6 +475,59 @@ class Runtime : public RuntimeBase, public HandleRootOwner {
   /// 256 characters are pre-allocated. The rest are allocated every time.
   Handle<StringPrimitive> getCharacterString(char16_t ch);
 
+  /// Compile-time ceiling on the intern length cutoff, in characters. This
+  /// dimensions the stack buffers in internJSONStringValue and at the JSI
+  /// boundary, so it has to be a constant; the *effective* cutoff is
+  /// RuntimeConfig's InternMaxChars clamped to it, and is queried through
+  /// shouldInternStringValue rather than compared against directly.
+  ///
+  /// 64 rather than the original 32 because once interning shipped, the waste
+  /// left over sat mostly above the old cutoff: 4.04 MiB in 33-64 characters
+  /// against 3.18 MiB still under 32.
+  static constexpr uint32_t kJSONInternMaxChars = 64;
+
+  /// Default number of intern table slots, used when RuntimeConfig does not
+  /// say otherwise. 262,144 puts the load factor at 0.25 against the 64,711
+  /// distinct duplicated values a snapshot found, for 1 MiB of compressed
+  /// pointers. See internJSONStringValue.
+  static constexpr uint32_t kJSONInternTableDefaultSize = 262144;
+
+  /// Hard cap on configured slots. The config is CodePushable, so this bounds
+  /// what a bad value can cost: 4M slots is 16 MiB of table.
+  static constexpr uint32_t kJSONInternTableMaxSize = 1u << 22;
+
+  /// Whether internJSONStringValue should be consulted for a string of this
+  /// length. False for every length when interning is configured off, since
+  /// the cutoff is then 0.
+  bool shouldInternStringValue(size_t length) const {
+    return length != 0 && length <= internMaxChars_;
+  }
+
+  /// Canonicalize a short JSON string *value* against a fixed-size weak table,
+  /// so repeated parses of the same payload share one StringPrimitive.
+  ///
+  /// Keys already go through the IdentifierTable; values get a fresh
+  /// StringPrimitive every parse. A snapshot put 20.9 MiB of the live heap in
+  /// redundant copies of values 16 chars or shorter -- 1,204,022 string nodes
+  /// for 166,159 distinct contents, 27 copies of each duplicated short string
+  /// on average. See clients/docs/gc-fragmentation-investigation.md.
+  ///
+  /// Callers must have cleared shouldInternStringValue(str.size()) first, \p
+  /// hash must be its JenkinsHash, and \p isASCII selects the representation
+  /// exactly as in StringPrimitive::createWithKnownEncoding.
+  ///
+  /// The table is advisory: a collision replaces the occupant and a miss
+  /// returns a fresh string, so nothing depends on getting a hit. Entries are
+  /// weak, so a canonical string costs nothing once its last real reference
+  /// dies. Strings are allocated long-lived both because one shared across
+  /// parses outlives any single parse, and because that is what makes marking
+  /// these weak roots under markLongLived sound -- the same trade
+  /// charStrings_ makes.
+  CallResult<HermesValue> internJSONStringValue(
+      llvh::ArrayRef<char16_t> str,
+      bool isASCII,
+      uint32_t hash);
+
   CodeBlock *getEmptyCodeBlock() const {
     assert(emptyCodeBlock_ && "Invalid empty code block");
     return emptyCodeBlock_;
@@ -1328,6 +1381,26 @@ class Runtime : public RuntimeBase, public HandleRootOwner {
   /// Caches for property lookups in non-JS code.
   WritePropertyCacheEntry fixedWritePropCache_[(size_t)PropCacheID::_COUNT];
   ReadPropertyCacheEntry fixedReadPropCache_[(size_t)PropCacheID::_COUNT];
+
+  /// Canonical short JSON string values, indexed by JenkinsHash. Direct-mapped
+  /// and weak; see internJSONStringValue. Visited only under markLongLived, so
+  /// the slot count is off the young-gen root scan and a larger table costs
+  /// scan time only when a compaction moves the old gen.
+  ///
+  /// Sized once in the constructor from RuntimeConfig's InternTableSize, which
+  /// is why this is a heap buffer rather than the std::array it started as:
+  /// the count is the main thing worth retuning, and baking it in meant a
+  /// native build to change it. Empty when interning is configured off.
+  std::vector<WeakRoot<StringPrimitive>> jsonInternTable_;
+
+  /// Index mask for jsonInternTable_, i.e. its size - 1. The size is rounded
+  /// up to a power of two so this replaces a modulo on the hash.
+  uint32_t jsonInternTableMask_{0};
+
+  /// Effective intern length cutoff: RuntimeConfig's InternMaxChars clamped to
+  /// kJSONInternMaxChars, or 0 when interning is off. Read through
+  /// shouldInternStringValue.
+  uint32_t internMaxChars_{0};
 
   /// StringPrimitive representation of the first 256 characters.
   /// These are allocated as "long-lived" objects, so they don't need

@@ -318,6 +318,30 @@ Runtime::Runtime(
       (void *)this == (void *)(PointerBase *)this &&
       "cast to PointerBase should be no-op");
   crashMgr_->registerMemory(this, sizeof(Runtime));
+
+  // [Sleeper] Size the short-string intern table. Both knobs come from a
+  // CodePushable config, so both are clamped here: either one at 0 turns
+  // interning off, which leaves the table empty and makes
+  // shouldInternStringValue false for every length, so every caller falls
+  // through to the ordinary string creation it used before this existed.
+  {
+    const uint32_t cutoff =
+        std::min(runtimeConfig.getInternMaxChars(), kJSONInternMaxChars);
+    const uint32_t requested =
+        std::min(runtimeConfig.getInternTableSize(), kJSONInternTableMaxSize);
+    if (cutoff != 0 && requested != 0) {
+      // Round up to a power of two so the index is a mask rather than a
+      // modulo. Done with a shift loop to keep this free of an include.
+      uint32_t slots = 1;
+      while (slots < requested) {
+        slots <<= 1;
+      }
+      jsonInternTable_.resize(slots);
+      jsonInternTableMask_ = slots - 1;
+      internMaxChars_ = cutoff;
+    }
+  }
+
   auto maxNumRegisters = runtimeConfig.getMaxNumRegisters();
   if (LLVM_UNLIKELY(maxNumRegisters > kMaxSupportedNumRegisters)) {
     hermes_fatal("RuntimeConfig maxNumRegisters too big");
@@ -732,6 +756,9 @@ void Runtime::markWeakRoots(WeakRootAcceptor &acceptor, bool markLongLived) {
     }
     for (auto &entry : fixedReadPropCache_) {
       acceptor.acceptWeak(entry.clazz);
+    }
+    for (auto &entry : jsonInternTable_) {
+      acceptor.acceptWeak(entry);
     }
   }
   for (auto &rm : runtimeModuleList_)
@@ -1661,6 +1688,68 @@ Handle<StringPrimitive> Runtime::getCharacterString(char16_t ch) {
 
   return makeHandle<StringPrimitive>(
       ignoreAllocationFailure(StringPrimitive::create(*this, UTF16Ref(ch))));
+}
+
+CallResult<HermesValue> Runtime::internJSONStringValue(
+    llvh::ArrayRef<char16_t> str,
+    bool isASCII,
+    uint32_t hash) {
+  assert(
+      shouldInternStringValue(str.size()) &&
+      "internJSONStringValue: caller must apply the length cutoff");
+  assert(
+      !jsonInternTable_.empty() &&
+      jsonInternTableMask_ == jsonInternTable_.size() - 1 &&
+      "intern table mask must match its size");
+  WeakRoot<StringPrimitive> &slot =
+      jsonInternTable_[hash & jsonInternTableMask_];
+
+  // Probe before allocating. get() applies the weak-ref read barrier, so a hit
+  // during concurrent marking keeps the string alive for that cycle.
+  if (StringPrimitive *cached = slot.get(*this, getHeap())) {
+    if (cached->getStringLength() == str.size() &&
+        cached->isASCII() == isASCII && !cached->isExternal()) {
+      bool equal = true;
+      if (isASCII) {
+        llvh::ArrayRef<char> chars = cached->getStringRef<char>();
+        for (size_t i = 0, e = str.size(); i != e; ++i) {
+          const auto c =
+              static_cast<char16_t>(static_cast<unsigned char>(chars[i]));
+          if (str[i] != c) {
+            equal = false;
+            break;
+          }
+        }
+      } else {
+        equal = str.equals(cached->getStringRef<char16_t>());
+      }
+      if (equal) {
+        return HermesValue::encodeStringValue(cached);
+      }
+    }
+  }
+
+  // Copy onto the stack before allocating: str can point into the JSON source
+  // string, which a GC triggered by the allocation below is free to move.
+  CallResult<HermesValue> created{ExecutionStatus::EXCEPTION};
+  if (isASCII) {
+    char narrow[kJSONInternMaxChars];
+    for (size_t i = 0, e = str.size(); i != e; ++i) {
+      narrow[i] = static_cast<char>(str[i]);
+    }
+    created =
+        StringPrimitive::createLongLived(*this, ASCIIRef(narrow, str.size()));
+  } else {
+    char16_t wide[kJSONInternMaxChars];
+    std::copy(str.begin(), str.end(), wide);
+    created =
+        StringPrimitive::createLongLived(*this, UTF16Ref(wide, str.size()));
+  }
+  if (LLVM_UNLIKELY(created == ExecutionStatus::EXCEPTION)) {
+    return ExecutionStatus::EXCEPTION;
+  }
+  slot.set(*this, vmcast<StringPrimitive>(*created));
+  return created;
 }
 
 static constexpr uint16_t FROZEN_FLAG = 0x8000;
