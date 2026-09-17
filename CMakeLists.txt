@@ -150,7 +150,11 @@ set(HERMESVM_ALLOW_HUGE_PAGES OFF CACHE BOOL
 
 # Note that smaller heap segments will lower the maximum number of properties
 # that can be stored in an object.
-set(HERMESVM_LOG_HEAP_SEGMENT_SIZE 22
+# Sleeper: 24 (16 MB) rather than the stock 22 (4 MB). The young generation is one segment, so this
+# is the nursery ceiling, and Hades' pause-time controller was pinned against it for whole sessions
+# while promotion accounted for 66% of young-GC pause time. See
+# clients/docs/gc-fragmentation-investigation.md.
+set(HERMESVM_LOG_HEAP_SEGMENT_SIZE 24
         CACHE STRING
         "Base 2 log of the size of segments in the GC managed heap in bytes.")
 
