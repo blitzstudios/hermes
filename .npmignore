@@ -1,0 +1,15 @@
+# Sleeper: trim the packed tree to what a Hermes build actually needs.
+#
+# The first three mirror React Native's own exclusion list in
+# sdks/hermes-engine/hermes-utils.rb (podspec_source_build_from_local_source_dir),
+# so they are already proven safe by the iOS build that uses it. benchmarks/ is
+# excluded additionally because no CMakeLists references it.
+#
+# Deliberately NOT excluded, despite being the bulk of the tree: API/hermes_sandbox
+# (~85 MB, vendored wasm runtime) because API/CMakeLists.txt adds it unconditionally,
+# and unittests/ + test/ because the root CMakeLists references test/static_asserts.
+# Dropping any of those breaks CMake configure rather than just shrinking the package.
+__tests__/
+external/flowtest/
+external/esprima/test_fixtures/
+benchmarks/

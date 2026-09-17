@@ -1,0 +1,10 @@
+{
+  "name": "@sleeperhq/hermes",
+  "version": "250829098.0.10-sleeper.1",
+  "license": "MIT",
+  "description": "Sleeper's fork of Hermes, based on the hermes-v250829098.0.10 tag that React Native 0.85.2 pins, with our VM changes as commits on top. Consumed as a source tree via REACT_NATIVE_OVERRIDE_HERMES_DIR; npm builds nothing here.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/blitzstudios/hermes.git"
+  }
+}
