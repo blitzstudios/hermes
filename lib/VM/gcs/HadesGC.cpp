@@ -1273,7 +1273,6 @@ HadesGC::HadesGC(
       revertToYGAtTTI_{gcConfig.getRevertToYGAtTTI()},
       overwriteDeadYGObjects_{gcConfig.getOverwriteDeadYGObjects()},
       occupancyTarget_(gcConfig.getOccupancyTarget()),
-      maxSearchCellsPerBucket_(gcConfig.getMaxSearchCellsPerBucket()),
       ygAverageSurvivalBytes_{
           /*weight*/ 0.5,
           /*init*/ ygSizeFactor_ * FixedSizeHeapSegment::maxSize() *
@@ -2414,10 +2413,7 @@ GCCell *HadesGC::OldGen::allocSlow(uint32_t sz) {
   assert(
       sz <= maxNormalAllocationSize() && "Allocating too large of an object");
   assert(gc_.gcMutex_ && "gcMutex_ must be held before calling oldGenAlloc");
-  // [Sleeper] Budgeted: a null here falls through to createSegment(), so giving
-  // up early costs at most a segment, and this is the call on the promotion hot
-  // path that the budget exists for.
-  if (GCCell *cell = search(sz, Budgeted::Yes)) {
+  if (GCCell *cell = search(sz)) {
     return cell;
   }
 
@@ -2452,13 +2448,7 @@ GCCell *HadesGC::OldGen::allocSlow(uint32_t sz) {
   gc_.waitForCollectionToFinish("full heap");
 
   // Repeat the search in case the collection did free memory.
-  // [Sleeper] Unbudgeted, and this is the important one: we are already at the
-  // max heap size, createSegment() has failed once, and the only thing after
-  // this is oom(). A budgeted search can return null while a usable cell sits
-  // at position 65 of a bucket, which would turn a survivable allocation into
-  // a crash. Completeness matters more than latency on a path that has already
-  // blocked the mutator on waitForCollectionToFinish.
-  if (GCCell *cell = search(sz, Budgeted::No)) {
+  if (GCCell *cell = search(sz)) {
     return cell;
   }
   // It's possible that the collection freed some JumboHeapSegments, so try
@@ -2496,18 +2486,9 @@ uint32_t HadesGC::OldGen::getFreelistBucket(uint32_t size) {
   return bucket;
 }
 
-GCCell *HadesGC::OldGen::search(uint32_t sz, Budgeted budgeted) {
+GCCell *HadesGC::OldGen::search(uint32_t sz) {
   // Once we're examining the rest of the free list, it's a first-fit algorithm.
   // This approach approximates finding the smallest possible fit.
-  //
-  // [Sleeper] The budget is GCConfig's MaxSearchCellsPerBucket, where 0 means
-  // unbounded, so a bad config degrades to stock Hermes rather than to a
-  // nursery that cannot promote. ~0u rather than numeric_limits, which would
-  // need an extra include here.
-  const uint32_t configuredBudget = gc_.maxSearchCellsPerBucket_;
-  const uint32_t cellBudget =
-      (budgeted == Budgeted::Yes && configuredBudget != 0) ? configuredBudget
-                                                           : ~0u;
 
   // A free cell serves sz either as an exact fit or by splitting off a
   // remainder of at least minAllocationSize(); a cell sized strictly between
@@ -2529,13 +2510,6 @@ GCCell *HadesGC::OldGen::search(uint32_t sz, Budgeted budgeted) {
         getFreelistBucket(sz + minAllocationSize()));
   for (; bucket < kNumFreelistBuckets;
        bucket = freelistBucketBitArray_.findNextSetBitFrom(bucket + 1)) {
-    // [Sleeper] Budget is per bucket, not per call, so abandoning a hopeless
-    // bucket still leaves every larger one reachable. See GCConfig's
-    // MaxSearchCellsPerBucket. If they are all abandoned, search
-    // returns nullptr and allocSlow falls back to a fresh segment, which is
-    // the same path a genuinely full freelist already takes.
-    uint32_t cellsWalkedInBucket = 0;
-    bool budgetExhausted = false;
     auto *segBucket = buckets_[bucket].next;
     do {
       // Need to track the previous entry in order to change the next pointer.
@@ -2543,13 +2517,6 @@ GCCell *HadesGC::OldGen::search(uint32_t sz, Budgeted budgeted) {
       AssignableCompressedPointer cellCP = segBucket->head;
 
       do {
-        // [Sleeper] Checked before the cell is touched so the walk stops at the
-        // budget rather than one cell past it.
-        if (cellsWalkedInBucket >= cellBudget) {
-          budgetExhausted = true;
-          break;
-        }
-        ++cellsWalkedInBucket;
         auto *cell =
             vmcast<FreelistCell>(cellCP.getNonNull(gc_.getPointerBase()));
         // [Sleeper] Every free-list cell examined by this first-fit walk.
@@ -2609,10 +2576,6 @@ GCCell *HadesGC::OldGen::search(uint32_t sz, Budgeted budgeted) {
         prevLoc = &cell->next_;
         cellCP = cell->next_;
       } while (cellCP);
-      // [Sleeper] The budget spans every segment's list for this bucket, so it
-      // has to end the segment walk too, not just the cell walk.
-      if (budgetExhausted)
-        break;
       segBucket = segBucket->next;
     } while (segBucket);
   }

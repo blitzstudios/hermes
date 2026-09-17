@@ -870,41 +870,6 @@ class HadesGC final : public GCBase {
     static constexpr size_t kNumFreelistBuckets =
         kNumSmallFreelistBuckets + kNumLargeFreelistBuckets;
 
-    /// [Sleeper] Cap on the cells search() will examine in a single bucket
-    /// before giving up on it and moving to the next, larger one.
-    ///
-    /// Only the bucket a request lands in can hold cells too small to satisfy
-    /// it: the small buckets are exact size classes, and every later bucket
-    /// holds cells strictly larger than the request. So the walk below is
-    /// unbounded in exactly one bucket, and the cells it rejects there can
-    /// never satisfy this size.
-    ///
-    /// Sizing this is not about how long the freelist gets -- it does not get
-    /// long. A captured session walked 3.6 billion cells, but it also promoted
-    /// 4.3 GB, so the mean walk was only ~55-110 cells; the total is driven by
-    /// promoting ~70 million objects, not by any single walk. What needs
-    /// clipping is the tail, where a walk runs into the thousands and a
-    /// collection stalls for 1,046 ms.
-    ///
-    /// Modelled against that session, 64 removes 52-70% of the cells walked
-    /// and every pause over 100 ms, where 128 removed only 33-52% because it
-    /// sits above the median walk. Lower is not free: abandoning a bucket
-    /// takes a larger cell and splits it, and if every bucket is abandoned
-    /// allocSlow adds a segment, which grows the heap. That needs cells to
-    /// fail in a bucket above the request, where they are strictly larger and
-    /// so nearly always fit, and it is worth watching segment count in a
-    /// capture rather than assuming.
-    ///
-    /// The value now lives in GCConfig as MaxSearchCellsPerBucket, defaulting
-    /// to the 64 above, so it can be retuned from native_config.json without a
-    /// native build; 0 restores the unbounded walk. Read via
-    /// gc_.maxSearchCellsPerBucket_.
-
-    /// [Sleeper] Whether search() may abandon a bucket after the configured
-    /// cell budget. Named rather than a bare bool so the last-resort call site
-    /// reads as the deliberate exception it is.
-    enum class Budgeted { No, Yes };
-
     /// \return the index of the bucket in freelistBuckets_ corresponding to
     /// \p size.
     /// \post The returned index is less than kNumFreelistBuckets.
@@ -1048,16 +1013,9 @@ class HadesGC final : public GCBase {
     } sweepIterator_;
 
     /// Searches the OG for a space to allocate memory into.
-    /// \param budgeted Whether to cap the walk at GCConfig's
-    ///   MaxSearchCellsPerBucket. [Sleeper] Pass Budgeted::No wherever a null return
-    ///   would be treated as "the heap is full" rather than "try a new segment",
-    ///   since a budgeted search can return null while a usable cell still
-    ///   exists. There is deliberately no default: the two callers want
-    ///   different answers.
     /// \return A pointer to uninitialized memory that can be written into, null
-    ///   if no such space exists (or, when budgeted, if none was found within
-    ///   the budget).
-    GCCell *search(uint32_t sz, Budgeted budgeted);
+    ///   if no such space exists.
+    GCCell *search(uint32_t sz);
 
     /// Common path for when an allocation has succeeded.
     /// \param cell The free memory that will soon have an object allocated into
@@ -1274,11 +1232,6 @@ class HadesGC final : public GCBase {
 
   /// Target OG occupancy ratio at the end of an OG collection.
   const double occupancyTarget_;
-
-  /// [Sleeper] Cells OldGen::search may walk in a single freelist bucket
-  /// before abandoning it, or 0 for stock Hermes' unbounded walk. Read
-  /// through gc_ by OldGen, the way occupancyTarget_ above already is.
-  const uint32_t maxSearchCellsPerBucket_;
 
   /// The threshold, expressed as the occupied fraction of the target OG size,
   /// at which we should start an OG collection.
