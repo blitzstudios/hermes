@@ -187,21 +187,29 @@ if(APPLE AND HERMES_BUILD_APPLE_FRAMEWORK)
     MACOSX_FRAMEWORK_IDENTIFIER dev.hermesengine.${HERMES_APPLE_TARGET_PLATFORM}
   )
   # Define the deployment target in the frameworks metadata
+  #
+  # Sleeper: plutil -replace rather than PlistBuddy "Add". Add fails with
+  # "Entry Already Exists" once the Info.plist already carries the key, which is
+  # every incremental rebuild and every variant after the first in a release
+  # lane. CMake treats the POST_BUILD failure as a build failure and deletes the
+  # framework it just linked, so from-source Hermes could only be built once per
+  # clean tree. plutil -replace adds when missing, overwrites when present, and
+  # exits 0 either way.
   if(HERMES_APPLE_TARGET_PLATFORM MATCHES "iphone")
     add_custom_command(TARGET hermesvm POST_BUILD
-      COMMAND /usr/libexec/PlistBuddy -c "Add :MinimumOSVersion string ${CMAKE_OSX_DEPLOYMENT_TARGET}" $<TARGET_FILE_DIR:hermesvm>/Info.plist
+      COMMAND plutil -replace MinimumOSVersion -string ${CMAKE_OSX_DEPLOYMENT_TARGET} $<TARGET_FILE_DIR:hermesvm>/Info.plist
     )
   elseif(HERMES_APPLE_TARGET_PLATFORM MATCHES "appletv")
     add_custom_command(TARGET hermesvm POST_BUILD
-      COMMAND /usr/libexec/PlistBuddy -c "Add :MinimumOSVersion string ${CMAKE_OSX_DEPLOYMENT_TARGET}" $<TARGET_FILE_DIR:hermesvm>/Info.plist
+      COMMAND plutil -replace MinimumOSVersion -string ${CMAKE_OSX_DEPLOYMENT_TARGET} $<TARGET_FILE_DIR:hermesvm>/Info.plist
     )
   elseif(HERMES_APPLE_TARGET_PLATFORM MATCHES "catalyst")
     add_custom_command(TARGET hermesvm POST_BUILD
-      COMMAND /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string ${CMAKE_OSX_DEPLOYMENT_TARGET}" $<TARGET_FILE_DIR:hermesvm>/Resources/Info.plist
+      COMMAND plutil -replace LSMinimumSystemVersion -string ${CMAKE_OSX_DEPLOYMENT_TARGET} $<TARGET_FILE_DIR:hermesvm>/Resources/Info.plist
     )
   elseif(HERMES_APPLE_TARGET_PLATFORM MATCHES "macos")
     add_custom_command(TARGET hermesvm POST_BUILD
-      COMMAND /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string ${CMAKE_OSX_DEPLOYMENT_TARGET}" $<TARGET_FILE_DIR:hermesvm>/Resources/Info.plist
+      COMMAND plutil -replace LSMinimumSystemVersion -string ${CMAKE_OSX_DEPLOYMENT_TARGET} $<TARGET_FILE_DIR:hermesvm>/Resources/Info.plist
     )
   elseif(HERMES_APPLE_TARGET_PLATFORM MATCHES "xr")
     if(CMAKE_VERSION VERSION_LESS 3.28.4)
@@ -209,7 +217,7 @@ if(APPLE AND HERMES_BUILD_APPLE_FRAMEWORK)
     endif()
 
     add_custom_command(TARGET hermesvm POST_BUILD
-      COMMAND /usr/libexec/PlistBuddy -c "Add :MinimumOSVersion string ${CMAKE_OSX_DEPLOYMENT_TARGET}" $<TARGET_FILE_DIR:hermesvm>/Info.plist
+      COMMAND plutil -replace MinimumOSVersion -string ${CMAKE_OSX_DEPLOYMENT_TARGET} $<TARGET_FILE_DIR:hermesvm>/Info.plist
     )
   endif()
 endif()
