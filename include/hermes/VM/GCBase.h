@@ -679,6 +679,12 @@ class GCBase {
     /// Track all samples that have been taken.
     llvh::DenseMap<HeapSnapshot::NodeID, Sample> samples_;
 
+    /// [Sleeper] Churn mode never removes samples, so `freeAlloc` and `updateSize`
+    /// skip the object-ID probe they do for every cell the GC reclaims. Reports every
+    /// sampled allocation in the window, not only those reachable at stop time.
+    bool churnMode_{false};
+    std::vector<Sample> churnSamples_;
+
     /// Use a poisson distribution to decide when to take the next sample.
     std::minstd_rand randomEngine_;
     std::unique_ptr<std::poisson_distribution<>> dist_;

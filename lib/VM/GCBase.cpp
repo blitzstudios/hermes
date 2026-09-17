@@ -26,6 +26,7 @@
 
 #include <inttypes.h>
 #include <clocale>
+#include <cstdlib>
 #include <stdexcept>
 #include <system_error>
 
@@ -1522,6 +1523,10 @@ void GCBase::SamplingAllocationLocationTracker::enable(
   if (seed < 0) {
     seed = std::random_device()();
   }
+  // [Sleeper] Latch set by `__startAllocProfile`. Read here rather than taken as a
+  // parameter so the CDP `HeapProfiler.startSampling` path, and therefore React
+  // Native DevTools, keeps stock behavior.
+  churnMode_ = std::getenv("HERMES_SAMPLING_CHURN_MODE") != nullptr;
   randomEngine_.seed(seed);
   dist_ = llvh::make_unique<std::poisson_distribution<>>(samplingInterval);
   limit_ = nextSample();
@@ -1539,6 +1544,9 @@ void GCBase::SamplingAllocationLocationTracker::disable(llvh::raw_ostream &os) {
     const Sample &sample = s.second;
     sizesToCounts[sample.node][sample.size]++;
   }
+  for (const Sample &sample : churnSamples_) {
+    sizesToCounts[sample.node][sample.size]++;
+  }
 
   // Have to emit the tree of stack frames before emitting samples, Chrome
   // requires the tree emitted first.
@@ -1548,9 +1556,13 @@ void GCBase::SamplingAllocationLocationTracker::disable(llvh::raw_ostream &os) {
     const Sample &sample = s.second;
     profile.emitSample(sample.size, sample.node, sample.id);
   }
+  for (const Sample &sample : churnSamples_) {
+    profile.emitSample(sample.size, sample.node, sample.id);
+  }
   profile.endSamples();
   dist_.reset();
   samples_.clear();
+  churnSamples_.clear();
   limit_ = 0;
 }
 
@@ -1567,6 +1579,15 @@ void GCBase::SamplingAllocationLocationTracker::newAlloc(
     return;
   }
   const auto *ip = gc_->gcCallbacks_.getCurrentIPSlow();
+  if (churnMode_) {
+    if (StackTracesTreeNode *node =
+            gc_->gcCallbacks_.getCurrentStackTracesTreeNode(ip)) {
+      std::lock_guard<Mutex> lk{mtx_};
+      churnSamples_.push_back(Sample{sz, node, nextSampleID_++});
+    }
+    limit_ = nextSample();
+    return;
+  }
   // This is stateful and causes the object to have an ID assigned.
   const auto id = gc_->getObjectID(ptr);
   if (StackTracesTreeNode *node =
@@ -1589,6 +1610,10 @@ void GCBase::SamplingAllocationLocationTracker::freeAlloc(
   if (!isEnabled()) {
     return;
   }
+  if (churnMode_) {
+    // Churn mode keeps every sample, so there is nothing to erase.
+    return;
+  }
   if (!gc_->hasObjectID(ptr)) {
     // This object's lifetime isn't being tracked.
     return;
@@ -1604,7 +1629,7 @@ void GCBase::SamplingAllocationLocationTracker::updateSize(
     uint32_t oldSize,
     uint32_t newSize) {
   int32_t delta = static_cast<int32_t>(newSize) - static_cast<int32_t>(oldSize);
-  if (!delta || !isEnabled() || !gc_->hasObjectID(ptr)) {
+  if (!delta || !isEnabled() || churnMode_ || !gc_->hasObjectID(ptr)) {
     // Nothing to update.
     return;
   }
