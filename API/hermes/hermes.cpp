@@ -18,6 +18,7 @@
 #include "hermes/Public/JSOutOfMemoryError.h"
 #include "hermes/Public/RuntimeConfig.h"
 #include "hermes/SourceMap/SourceMapParser.h"
+#include "hermes/Support/JenkinsHash.h"
 #include "hermes/Support/SimpleDiagHandler.h"
 #include "hermes/Support/UTF16Stream.h"
 #include "hermes/Support/UTF8.h"
@@ -2860,9 +2861,52 @@ void HermesRuntimeImpl::checkStatus(vm::ExecutionStatus status) {
   throwPendingError();
 }
 
+namespace {
+/// Widen a short ASCII string into the char16_t code units
+/// Runtime::internJSONStringValue hashes on, returning false if it is not a
+/// candidate to intern. The hash must be computed exactly as the JSON lexer
+/// computes it, or the same value arriving from native and from JSON.parse
+/// would take different slots and keep two canonical copies.
+/// The buffer is dimensioned by the compile-time ceiling, but whether a given
+/// length is a candidate is a runtime question -- the cutoff is configurable
+/// and can be 0 to turn interning off -- so it is asked of the runtime.
+template <typename CharT>
+bool prepareShortAsciiIntern(
+    const vm::Runtime &runtime,
+    const CharT *str,
+    size_t length,
+    char16_t (&wide)[vm::Runtime::kJSONInternMaxChars],
+    ::hermes::JenkinsHash &hash) {
+  if (!runtime.shouldInternStringValue(length))
+    return false;
+  hash = ::hermes::JenkinsHashInit;
+  for (size_t i = 0; i < length; ++i) {
+    const auto byte = static_cast<unsigned char>(str[i]);
+    if (byte >= 0x80)
+      return false;
+    wide[i] = static_cast<char16_t>(byte);
+    hash = ::hermes::updateJenkinsHash(hash, wide[i]);
+  }
+  return true;
+}
+} // namespace
+
+// Interned for the same reason JSON string values are: the heaviest duplicated
+// strings on the heap ("active", "WR", "nfl") arrive as SQLite text cells that
+// the native data layer re-materializes per row, so they reach JS through here
+// rather than through JSON.parse. The table is probed before allocating, which
+// is why this is cheaper than the path below and not merely a dedupe of it.
 vm::HermesValue HermesRuntimeImpl::stringHVFromAscii(
     const char *str,
     size_t length) {
+  char16_t wide[vm::Runtime::kJSONInternMaxChars];
+  ::hermes::JenkinsHash hash;
+  if (prepareShortAsciiIntern(runtime_, str, length, wide, hash)) {
+    auto internRes = runtime_.internJSONStringValue(
+        llvh::makeArrayRef(wide, length), /* isASCII */ true, hash);
+    checkStatus(internRes.getStatus());
+    return *internRes;
+  }
   auto strRes = vm::StringPrimitive::createEfficient(
       runtime_, llvh::makeArrayRef(str, length));
   checkStatus(strRes.getStatus());
@@ -2872,6 +2916,14 @@ vm::HermesValue HermesRuntimeImpl::stringHVFromAscii(
 vm::HermesValue HermesRuntimeImpl::stringHVFromUtf8(
     const uint8_t *utf8,
     size_t length) {
+  char16_t wide[vm::Runtime::kJSONInternMaxChars];
+  ::hermes::JenkinsHash hash;
+  if (prepareShortAsciiIntern(runtime_, utf8, length, wide, hash)) {
+    auto internRes = runtime_.internJSONStringValue(
+        llvh::makeArrayRef(wide, length), /* isASCII */ true, hash);
+    checkStatus(internRes.getStatus());
+    return *internRes;
+  }
   const bool IgnoreInputErrors = true;
   auto strRes = vm::StringPrimitive::createEfficient(
       runtime_, llvh::makeArrayRef(utf8, length), IgnoreInputErrors);
