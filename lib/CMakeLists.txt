@@ -177,6 +177,16 @@ add_library(hermesvm SHARED dummy.cpp)
 add_library(hermesvmlean SHARED dummy.cpp)
 
 if(APPLE AND HERMES_BUILD_APPLE_FRAMEWORK)
+  # Sleeper: the deployment target is carried by our own Info.plist template, not only by the
+  # POST_BUILD below. CMake writes this plist during configure, and the pod reconfigures once per
+  # variant while building `--target hermesvm`, so a second variant regenerates the plist without
+  # relinking and POST_BUILD never runs. altool then rejects the upload with error 90360.
+  if(HERMES_APPLE_TARGET_PLATFORM MATCHES "catalyst|macos")
+    set(HERMES_DEPLOYMENT_TARGET_KEY "LSMinimumSystemVersion")
+  else()
+    set(HERMES_DEPLOYMENT_TARGET_KEY "MinimumOSVersion")
+  endif()
+
   set_target_properties(hermesvm PROPERTIES
     FRAMEWORK TRUE
     VERSION ${PROJECT_VERSION}
@@ -185,6 +195,7 @@ if(APPLE AND HERMES_BUILD_APPLE_FRAMEWORK)
     MACOSX_FRAMEWORK_SHORT_VERSION_STRING ${PROJECT_VERSION}
     MACOSX_FRAMEWORK_BUNDLE_VERSION ${PROJECT_VERSION}
     MACOSX_FRAMEWORK_IDENTIFIER dev.hermesengine.${HERMES_APPLE_TARGET_PLATFORM}
+    MACOSX_FRAMEWORK_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/HermesFrameworkInfo.plist.in
   )
   # Define the deployment target in the frameworks metadata
   #
