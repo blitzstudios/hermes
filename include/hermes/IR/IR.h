@@ -2601,6 +2601,9 @@ class Module : public Value {
   std::unordered_map<RawStringList, uint32_t, HashRawStrings>
       templateObjectIDMap_;
 
+  /// The IDs in templateObjectIDMap_ when they are derived from the strings.
+  llvh::DenseSet<uint32_t> usedTemplateObjectIDs_;
+
   /// Set to true when lowerIR has been called on this Module.
   bool isLowered_{false};
 
@@ -2825,6 +2828,11 @@ class Module : public Value {
   ///   and the id is the newly allocated template object ID.
   std::pair<llvh::ArrayRef<LiteralString *>, uint32_t> emplaceTemplateObject(
       RawStringList &&rawStrings);
+
+  /// \return the raw strings of every template object, mapped to its ID.
+  const auto &getTemplateObjectIDMap() const {
+    return templateObjectIDMap_;
+  }
 
   bool isLowered() const {
     return isLowered_;

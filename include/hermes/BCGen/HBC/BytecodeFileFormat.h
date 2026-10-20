@@ -444,6 +444,11 @@ struct StringSwitchTableCase {
       : caseLabelStringID(caseLabelStringID), target(target) {}
 };
 
+/// Prefix of the string table entries that record a template object's ID and
+/// raw strings when IDs are derived from the strings. hbc-link checks them
+/// across modules; no instruction refers to them.
+constexpr char kTemplateObjectIDPrefix[] = "\x7f" "hbc-link template ";
+
 /// A function may have jump tables and/or string switch tables appended.
 /// If both are present, the jump table comes first.  We add padding to
 /// ensure that the first table, of whichever kind, is aligned.  Therefore,

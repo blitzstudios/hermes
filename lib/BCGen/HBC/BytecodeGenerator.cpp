@@ -420,6 +420,22 @@ void BytecodeModuleGenerator::collectStrings() {
     }
   }
 
+  if (M_->getContext().getCodeGenerationSettings().contentTemplateObjectIDs) {
+    std::vector<std::pair<uint32_t, std::string>> templates;
+    for (const auto &[rawStrings, id] : M_->getTemplateObjectIDMap()) {
+      std::string entry{kTemplateObjectIDPrefix};
+      entry += std::to_string(id);
+      for (LiteralString *str : rawStrings) {
+        entry += '\0';
+        entry += str->getValue().str();
+      }
+      templates.push_back({id, std::move(entry)});
+    }
+    std::sort(templates.begin(), templates.end());
+    for (const auto &[id, entry] : templates)
+      strings.addString(entry, /* isIdentifier */ false);
+  }
+
   if (!M_->getCJSModulesResolved()) {
     for (auto [F, functionID] : functionIDMap_) {
       if (auto *cjsModule = M_->findCJSModule(F)) {

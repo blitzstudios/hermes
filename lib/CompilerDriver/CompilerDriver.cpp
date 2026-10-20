@@ -620,6 +620,13 @@ static opt<bool> EnableFastNoncompliant(
         "UNSUPPORTED: Enable all options that result in faster, but noncompliant, behavior."),
     cat(CompilerCategory));
 
+static opt<bool> ContentTemplateObjectIDs(
+    "Xcontent-template-ids",
+    init(false),
+    Hidden,
+    desc("Derive template object IDs from their raw strings (for hbc-link)"),
+    cat(CompilerCategory));
+
 static opt<bool> EnableTDZ(
     "Xenable-tdz",
     init(false),
@@ -1110,6 +1117,7 @@ std::shared_ptr<Context> createContext(
   codeGenOpts.dumpIRBetweenPasses = cl::DumpBetweenPasses;
   codeGenOpts.verifyIRBetweenPasses = cl::compilerRuntimeFlags.VerifyIR;
   codeGenOpts.colors = cl::Colors;
+  codeGenOpts.contentTemplateObjectIDs = cl::ContentTemplateObjectIDs;
   codeGenOpts.dumpFunctions.insert(
       cl::DumpFunctions.begin(), cl::DumpFunctions.end());
   codeGenOpts.noDumpFunctions.insert(

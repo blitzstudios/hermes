@@ -52,6 +52,9 @@ struct CodeGenerationSettings {
   StringSetVector noDumpFunctions;
   // Time the optimizer by phases.
   bool timeCompiler{false};
+  /// Derive template object IDs from the raw strings, so separately compiled
+  /// modules can be linked into one bytecode file.
+  bool contentTemplateObjectIDs{false};
 };
 
 struct OptimizationSettings {

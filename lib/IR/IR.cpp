@@ -818,13 +818,36 @@ llvh::DenseSet<Function *> Module::getFunctionsInSegment(uint32_t segment) {
   return result;
 }
 
+/// FNV-1a over the raw strings, kept to 31 bits: the runtime's template cache
+/// reserves the top two uint32_t values.
+static uint32_t contentTemplateObjectID(const Module::RawStringList &raw) {
+  uint32_t hash = 2166136261u;
+  auto mix = [&hash](uint8_t byte) {
+    hash ^= byte;
+    hash *= 16777619u;
+  };
+  for (LiteralString *str : raw) {
+    for (char c : str->getValue().str())
+      mix(c);
+    mix(0xff);
+  }
+  return hash & 0x7fffffff;
+}
+
 std::pair<llvh::ArrayRef<LiteralString *>, uint32_t>
 Module::emplaceTemplateObject(RawStringList &&rawStrings) {
   // Try inserting into the map with a dummy value.
   auto res = templateObjectIDMap_.emplace(std::move(rawStrings), 0);
   if (res.second) {
-    // Insertion succeeded. Overwrite the value with the correct id.
-    res.first->second = templateObjectIDMap_.size() - 1;
+    if (getContext().getCodeGenerationSettings().contentTemplateObjectIDs) {
+      uint32_t id = contentTemplateObjectID(res.first->first);
+      if (!usedTemplateObjectIDs_.insert(id).second)
+        hermes_fatal("template object ID collision");
+      res.first->second = id;
+    } else {
+      // Insertion succeeded. Overwrite the value with the correct id.
+      res.first->second = templateObjectIDMap_.size() - 1;
+    }
   }
   return {res.first->first, res.first->second};
 }
