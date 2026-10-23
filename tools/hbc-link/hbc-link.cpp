@@ -11,6 +11,8 @@
 //        <bundle end line> <bundle end column>
 // Skeleton positions on a unit's line before the split column belong to the
 // module's first line; the rest belong to its last line.
+//
+// module-cache/compile.js writes the skeleton, units and manifest.
 
 #include "hermes/ADT/StringSetVector.h"
 #include "hermes/BCGen/HBC/BCProvider.h"
